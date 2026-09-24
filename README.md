@@ -20,20 +20,27 @@ A **personal finance agent** that answers questions about bank transactions usin
 
 ## Architecture
 
+Real **LangGraph** `StateGraph` (not a hand-rolled loop):
+
 ```mermaid
 flowchart TD
-  User[User question] --> Gate{Scope guardrail}
-  Gate -->|out of scope| Refuse[Refusal message]
-  Gate -->|in scope| Router[Rule router / LLM tool loop]
-  Router --> SQL[run_sql<br/>SELECT-only validator]
-  Router --> Agg[compute_aggregates]
-  Router --> Cat[categorise_transactions]
-  SQL --> DB[(SQLite transactions)]
+  START([START]) --> Guard[guardrail node]
+  Guard -->|refused| END1([END])
+  Guard -->|in scope| Rules[rules_router node]
+  Rules -->|deterministic hit| END2([END])
+  Rules -->|use_llm / no rule hit| Planner[planner node<br/>LLM bind_tools]
+  Planner -->|tool_calls| Tools[tools node<br/>ToolNode]
+  Planner -->|final prose| Final[final_answer node]
+  Tools --> Validate[validate node<br/>retry / fallback]
+  Validate -->|retry| Planner
+  Validate -->|ok or exhausted| Final
+  Final --> END3([END])
+  Tools --> SQL[run_sql SELECT-only]
+  Tools --> Agg[compute_aggregates]
+  Tools --> Cat[categorise_transactions]
+  SQL --> DB[(SQLite)]
   Agg --> DB
   Cat --> DB
-  SQL --> Answer[Grounded answer]
-  Agg --> Answer
-  Cat --> Answer
 ```
 
 ---
@@ -42,7 +49,7 @@ flowchart TD
 
 | Layer | Choice |
 |-------|--------|
-| Agent | LangGraph-style tool loop (`langgraph` in deps) |
+| Agent | LangGraph `StateGraph` (guardrail → rules → planner ⇄ tools → validate → final) |
 | LLM | Gemini / OpenAI / Anthropic (env-selected) |
 | DB | SQLite |
 | API | FastAPI |

@@ -2,7 +2,29 @@
 
 ## Big picture
 
-An agent is an LLM (or a rule router) that can **call tools**. Here the tools talk to a SQLite ledger of bank transactions. Guardrails stop dangerous SQL and off-topic questions.
+An agent is an LLM (or a rule router) that can **call tools**. Here the tools talk to a SQLite ledger of bank transactions. The control flow is a real **LangGraph `StateGraph`** with typed state, nodes, and conditional edges. Guardrails stop dangerous SQL and off-topic questions.
+
+---
+
+## LangGraph topology
+
+```
+START → guardrail → (refuse → END)
+                  → rules_router → (deterministic answer → END)
+                                 → planner ⇄ tools → validate
+                                          ↘ final_answer → END
+```
+
+| Node | Role |
+|------|------|
+| `guardrail` | Scope / safety refusal **before** any tool runs |
+| `rules_router` | Offline answers for common intents when `use_llm=False` |
+| `planner` | `llm.bind_tools(tools).invoke(messages)` — may emit tool calls |
+| `tools` | LangGraph `ToolNode` executing the three finance tools |
+| `validate` | Inspect tool payloads; on failure, nudge + retry (bounded) |
+| `final_answer` | Produce the user-facing string from AI prose or a wrap-up call |
+
+Compiled once in `build_finance_graph()`; `FinanceAgent.chat()` just `invoke`s it.
 
 ---
 
@@ -25,18 +47,17 @@ Creates a simple `transactions` table. SQLite keeps the demo zero-ops.
 ### `tools/categoriser.py`
 Ordered regex rules (payroll → income, Whole Foods → groceries, …). Optional `llm_fallback` callable for unknowns.
 
-**Why rules first?** Fast, free, deterministic, easy to test. LLM as backup for long-tail merchants.
-
 ### `tools/aggregates.py`
-Pre-built GROUP BY for category / account / month — covers the most common questions without free-form SQL.
+Pre-built GROUP BY for category / account / month.
+
+### `agent/tools_langchain.py`
+Wraps the three tools as LangChain `StructuredTool`s closed over `db_path`. SQL validation errors are returned as `{"ok": false, ...}` so `ToolNode` does not crash the graph.
 
 ### `agent/graph.py`
-`FinanceAgent`:
-1. Scope guardrail → refuse.
-2. Deterministic rule router for common intents (works offline).
-3. Optional LLM tool loop with JSON tool calls and one retry on failure.
+Builds and compiles the `StateGraph`. `FinanceAgent` is a thin façade preserving the public `chat()` API used by CLI / FastAPI.
 
-**Why a rule router at all?** Portfolio demos and CI must work without API keys. The LLM path is there for the “real” agent story.
+### `llm/factory.py`
+Provider-agnostic factory. `MockChatModel` implements `bind_tools` and an optional `script` of `AIMessage`s (including `tool_calls`) so the graph is testable offline.
 
 ### `api/app.py` / `cli.py` / `evaluate.py`
 Thin interfaces over the same agent. Evaluation always measures categorisation accuracy; agent Q&A is opt-in with `--with-llm`.
@@ -45,10 +66,11 @@ Thin interfaces over the same agent. Evaluation always measures categorisation a
 
 ## Design choices
 
-1. **SELECT-only SQL** rather than an ORM query builder — shows you understand injection / privilege risk.
-2. **Rules before LLM** for categorisation — cost, latency, determinism.
-3. **Refusal patterns** — production agents need scope control, not just helpfulness.
-4. **Retry on tool failure** — fragile tool use is a common agent failure mode.
+1. **Real LangGraph** — explicit nodes/edges are easier to reason about than a hidden `for` loop, and match how production agent frameworks are described.
+2. **SELECT-only SQL** inside the tool — hard gate, not just a prompt.
+3. **Rules before LLM** when `use_llm=False` — demos and CI stay free of API keys.
+4. **Validate + retry node** — tool failure is a first-class edge, not an unhandled exception.
+5. **Refusal in its own node** — out-of-scope questions never reach tools.
 
 ---
 
@@ -57,44 +79,44 @@ Thin interfaces over the same agent. Evaluation always measures categorisation a
 **1. What is an AI agent?**
 A system that plans and uses tools/actions to achieve a goal, not just complete text.
 
-**2. Why validate SQL instead of trusting the model?**
+**2. What does LangGraph add over a bare LLM loop?**
+Explicit state, named nodes, conditional edges, retries, and a compiled runnable you can test and visualise.
+
+**3. Why validate SQL instead of trusting the model?**
 Models can be prompt-injected into emitting `DROP TABLE`. Validation is a hard gate.
 
-**3. How do you stop prompt injection via transaction descriptions?**
+**4. How do you stop prompt injection via transaction descriptions?**
 Treat DB text as untrusted data, not instructions; strip/sandbox tool outputs; keep system prompt separate.
 
-**4. Rule-based vs LLM categorisation trade-offs?**
+**5. Rule-based vs LLM categorisation trade-offs?**
 Rules: precise, cheap, brittle on novelty. LLM: flexible, expensive, non-deterministic. Hybrid is best.
 
-**5. What is LangGraph for?**
-Explicit state machines for multi-step agent workflows (cycles, retries, branching) beyond a single chain.
+**6. Walk me through your graph for “How much did I spend?” with `use_llm=False`.**
+`guardrail` pass → `rules_router` matches total-spending pattern → `run_readonly_sql` SUM → END with answer. Planner never runs.
 
-**6. How would you test an agent?**
-Unit-test tools + guardrails; golden-question sets; mock the LLM; track refusal rate and tool-error rate.
+**7. Same question with `use_llm=True`?**
+`guardrail` → `rules_router` skips (use_llm) → `planner` emits `run_sql` tool call → `tools` → `validate` ok → `final_answer` wrap-up → END.
 
-**7. How do you handle PII?**
-Don't log raw statements; encrypt at rest; redact in traces; synthetic data for demos.
+**8. What happens if the LLM emits `DELETE FROM transactions`?**
+`run_sql` validator raises / returns `ok:false` → `validate` increments retry, nudges planner → one more attempt → fallback message if still failing.
 
-**8. What does read-only mean in practice?**
-DB user privileges + statement allow-list + wrapped LIMIT — not just a prompt saying “don't modify”.
-
-**9. Failure modes of tool calling?**
-Wrong tool, bad args, timeouts, partial results, hallucinated success. Mitigate with schemas, retries, and grounded answers.
+**9. How do you test an agent without an API key?**
+`MockChatModel` with a `script` of `AIMessage(tool_calls=[...])` then a final prose `AIMessage`; pytest drives `chat(use_llm=True)`.
 
 **10. How would you add multi-user support?**
-Per-user DB / row-level `user_id` filter forced in every query; authn on `/chat`.
+Per-user DB / forced `user_id` predicate in every query; authn on `/chat`.
 
 **11. Why SQLite here?**
 Zero ops for a portfolio demo; swap to Postgres with the same SQL dialect subset later.
 
-**12. How do you measure categorisation quality?**
-Accuracy / F1 on labelled merchants; confusion matrix for systematic misses.
+**12. What is `bind_tools`?**
+Attaches JSON-schema tool definitions to the chat model so it can return structured `tool_calls` instead of free-form text.
 
 **13. What would you build next?**
-Budgets, anomaly detection, streaming bank APIs (Plaid), richer LangGraph graph with explicit nodes, eval harness with LLM-as-judge.
+Budgets, anomaly detection, streaming bank APIs (Plaid), checkpointed graph state, richer eval with LLM-as-judge.
 
 **14. Explain the refusal path.**
-Regex/keyword gate → fixed refusal string → no tools invoked. Prevents spending tokens and leaking data on off-topic asks.
+`guardrail` node → fixed refusal string → conditional edge to END. No tools invoked.
 
-**15. Walk through “How much did I spend on groceries?”**
-Guardrail pass → rule router extracts category → SELECT SUM(amount) WHERE category='groceries' AND amount<0 → format answer.
+**15. Difference between `ToolNode` and calling tools yourself?**
+`ToolNode` reads `tool_calls` from the last AI message, dispatches by name, and appends `ToolMessage`s — standard LangGraph wiring.
