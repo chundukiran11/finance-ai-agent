@@ -1,0 +1,52 @@
+[
+  {
+    "id": "fq01",
+    "question": "How much did I spend in total?",
+    "expected_contains": "spending"
+  },
+  {
+    "id": "fq02",
+    "question": "What is my total income?",
+    "expected_contains": "income"
+  },
+  {
+    "id": "fq03",
+    "question": "Give me a spending summary by category",
+    "expected_contains": "category"
+  },
+  {
+    "id": "fq04",
+    "question": "Show monthly totals",
+    "expected_contains": "20"
+  },
+  {
+    "id": "fq05",
+    "question": "How much spending on groceries?",
+    "expected_contains": "groceries"
+  },
+  {
+    "id": "fq06",
+    "question": "Categorise my transactions",
+    "expected_contains": "Categorised"
+  },
+  {
+    "id": "fq07",
+    "question": "What are my top transactions by amount?",
+    "expected_contains": "amount"
+  },
+  {
+    "id": "fq08",
+    "question": "How much spending on dining?",
+    "expected_contains": "dining"
+  },
+  {
+    "id": "fq09",
+    "question": "Tell me a joke about pirates",
+    "expected_contains": "only help with personal-finance"
+  },
+  {
+    "id": "fq10",
+    "question": "Please diagnose my medical symptoms",
+    "expected_contains": "only help with personal-finance"
+  }
+]

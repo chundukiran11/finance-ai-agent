@@ -1,0 +1,7 @@
+{
+  "note": "Ground-truth categories live in data/synthetic_statement.csv (category column). This file documents the label schema.",
+  "categories": [
+    "income", "rent", "groceries", "transport", "entertainment",
+    "dining", "utilities", "health", "shopping", "travel", "cash", "transfers"
+  ]
+}

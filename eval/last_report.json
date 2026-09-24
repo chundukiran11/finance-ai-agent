@@ -1,0 +1,8 @@
+{
+  "categorisation_accuracy": 1.0,
+  "categorisation_correct": 300,
+  "categorisation_n": 300,
+  "categorisation_confusion_top": {},
+  "agent_answer_accuracy": null,
+  "note": "Agent Q&A accuracy requires a live LLM. Re-run with --with-llm after configuring an API key."
+}
