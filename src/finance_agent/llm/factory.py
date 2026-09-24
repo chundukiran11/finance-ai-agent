@@ -2,26 +2,54 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from pydantic import Field
+from langchain_core.tools import BaseTool
+from pydantic import Field, PrivateAttr
 
 from finance_agent.config import Settings, get_settings
 
 
 class MockChatModel(BaseChatModel):
-    """Deterministic chat model for tests."""
+    """Deterministic chat model for tests.
+
+    Supports ``bind_tools`` and an optional ``script`` of ``AIMessage``s so
+    LangGraph tool-calling loops can be exercised without an API key.
+    """
 
     canned_response: str = Field(
         default="I can help with your finances using the available tools."
     )
+    script: list[AIMessage] = Field(default_factory=list)
+    bound_tools: list[Any] = Field(default_factory=list)
+    _call_index: int = PrivateAttr(default=0)
 
     @property
     def _llm_type(self) -> str:
         return "mock-chat"
+
+    def bind_tools(
+        self,
+        tools: Sequence[BaseTool | dict[str, Any] | type],
+        **kwargs: Any,
+    ) -> "MockChatModel":
+        """Attach tools and return ``self`` so scripted call indices stay shared.
+
+        Real chat models return a binding over the same underlying client; we
+        mirror that by mutating in place instead of ``model_copy``.
+        """
+        self.bound_tools = list(tools)
+        return self
+
+    def _next_message(self) -> AIMessage:
+        if self.script:
+            idx = min(self._call_index, len(self.script) - 1)
+            self._call_index += 1
+            return self.script[idx]
+        return AIMessage(content=self.canned_response)
 
     def _generate(
         self,
@@ -30,9 +58,7 @@ class MockChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return ChatResult(
-            generations=[ChatGeneration(message=AIMessage(content=self.canned_response))]
-        )
+        return ChatResult(generations=[ChatGeneration(message=self._next_message())])
 
 
 def get_chat_model(
@@ -40,9 +66,14 @@ def get_chat_model(
     *,
     mock: bool = False,
     mock_response: str | None = None,
+    mock_script: list[AIMessage] | None = None,
 ) -> BaseChatModel:
     if mock:
-        return MockChatModel(canned_response=mock_response or MockChatModel.model_fields["canned_response"].default)
+        return MockChatModel(
+            canned_response=mock_response
+            or "I can help with your finances using the available tools.",
+            script=list(mock_script or []),
+        )
 
     cfg = settings or get_settings()
     provider = cfg.llm_provider.lower()
