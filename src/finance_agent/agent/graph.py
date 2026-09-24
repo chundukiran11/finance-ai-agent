@@ -1,11 +1,25 @@
-"""LangGraph-based personal finance agent with tool calling and guardrails.
+"""Personal finance agent built on a real LangGraph ``StateGraph``.
 
-Design:
-- Intent gate refuses out-of-scope questions before any tool runs.
-- Tools: read-only SQL, aggregates, categorise.
-- On tool failure, the agent retries once with a fallback message.
-- When no LLM key is available, a deterministic rule-based router answers
-  common questions so demos and tests still work.
+Graph topology::
+
+    START → guardrail → (refuse → END)
+                      → rules_router → (hit → END)
+                                     → planner ⇄ tools → validate
+                                              ↘ final_answer → END
+
+Nodes
+-----
+- **guardrail** — refuse out-of-scope / unsafe questions before any tool runs.
+- **rules_router** — deterministic offline answers for common intents
+  (``use_llm=False`` path; keeps demos and CI free of API keys).
+- **planner** — LLM with ``bind_tools`` decides the next tool call or final prose.
+- **tools** — LangGraph ``ToolNode`` executing ``run_sql`` /
+  ``compute_aggregates`` / ``categorise_transactions``.
+- **validate** — inspect tool results; on failure, nudge the planner to retry
+  (bounded by ``max_tool_retries``).
+- **final_answer** — extract / produce the user-facing answer string.
+
+SQL SELECT-only validation lives inside ``run_sql`` (unchanged).
 """
 
 from __future__ import annotations
@@ -13,15 +27,25 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, TypedDict
+from typing import Annotated, Any, Literal, Sequence, TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
+from finance_agent.agent.tools_langchain import build_tools, tool_result_failed
 from finance_agent.config import Settings, get_settings
 from finance_agent.llm.factory import get_chat_model
 from finance_agent.tools.aggregates import compute_aggregates
-from finance_agent.tools.categoriser import categorise_all, categorise_description
+from finance_agent.tools.categoriser import categorise_all
 from finance_agent.tools.sql_tool import run_readonly_sql
 
 OUT_OF_SCOPE_PATTERNS = [
@@ -38,48 +62,316 @@ FINANCE_HINT = re.compile(
     re.I,
 )
 
+REFUSAL_TEXT = (
+    "I can only help with personal-finance questions about your "
+    "transactions (spending, income, categories, aggregates). "
+    "Please rephrase within that scope."
+)
+
 SYSTEM_PROMPT = """You are a careful personal-finance assistant.
 You may ONLY answer questions about the user's bank transactions using tools.
 Available tools: run_sql (SELECT only), compute_aggregates, categorise_transactions.
-Refuse questions outside personal finance. Never invent numbers — always use tools.
-If a tool fails, explain the error and suggest a simpler query."""
+Never invent numbers — always use tools for figures.
+If a tool fails, try a simpler SELECT or aggregates call."""
 
 
 class AgentState(TypedDict, total=False):
+    """Typed state flowing through the LangGraph."""
+
     question: str
-    messages: list
-    tool_results: list
+    use_llm: bool
+    messages: Annotated[list[BaseMessage], add_messages]
     answer: str
     refused: bool
+    route: str
+    retry_count: int
+    max_retries: int
+    tool_error: str | None
+
+
+def is_out_of_scope(question: str) -> bool:
+    """Return True when the question must be refused."""
+    if any(p.search(question) for p in OUT_OF_SCOPE_PATTERNS):
+        return True
+    if not FINANCE_HINT.search(question) and len(question.split()) > 3:
+        if re.search(r"\b(hello|hi|hey|help|what can you)\b", question, re.I):
+            return False
+        return True
+    return False
+
+
+def rule_route_answer(db_path: str, question: str) -> str | None:
+    """Deterministic answers for common intents (no LLM required)."""
+    q = question.lower()
+
+    if re.search(r"categoris|categorize|label (my )?transactions", q):
+        result = categorise_all(db_path, only_null=True)
+        return f"Categorised {result['updated']} transactions using rule-based patterns."
+
+    if re.search(r"by category|spending summary|breakdown|aggregate", q) or (
+        "how much" in q and "category" in q
+    ):
+        result = compute_aggregates(db_path, group_by="category")
+        lines = [
+            f"- {row['key']}: total={row['total']}, spending={row['spending']}, n={row['n_txns']}"
+            for row in result["rows"][:15]
+        ]
+        return "Spending by category:\n" + "\n".join(lines)
+
+    if re.search(r"by month|monthly", q):
+        result = compute_aggregates(db_path, group_by="month")
+        lines = [
+            f"- {row['key']}: total={row['total']}, spending={row['spending']}"
+            for row in result["rows"][:12]
+        ]
+        return "Monthly totals:\n" + "\n".join(lines)
+
+    if re.search(r"total (income|earned)", q) or "how much did i earn" in q:
+        result = run_readonly_sql(
+            db_path,
+            "SELECT ROUND(SUM(amount), 2) AS income FROM transactions WHERE amount > 0",
+        )
+        if result.get("ok") and result["rows"]:
+            return f"Total income: {result['rows'][0].get('income')}"
+        return f"Could not compute income: {result.get('error')}"
+
+    if re.search(r"total (spend|spent|spending|expenses)", q) or "how much did i spend" in q:
+        result = run_readonly_sql(
+            db_path,
+            "SELECT ROUND(SUM(amount), 2) AS spending FROM transactions WHERE amount < 0",
+        )
+        if result.get("ok") and result["rows"]:
+            return f"Total spending: {result['rows'][0].get('spending')}"
+        return f"Could not compute spending: {result.get('error')}"
+
+    m = re.search(r"spend(?:ing)? on ([a-z &]+)", q)
+    if m:
+        cat = m.group(1).strip().rstrip("?")
+        result = run_readonly_sql(
+            db_path,
+            "SELECT ROUND(SUM(amount), 2) AS spending, COUNT(*) AS n "
+            f"FROM transactions WHERE lower(category) = '{cat}' AND amount < 0",
+        )
+        if result.get("ok") and result["rows"]:
+            row = result["rows"][0]
+            return f"Spending on {cat}: {row.get('spending')} across {row.get('n')} transactions."
+
+    if "top" in q and "transaction" in q:
+        result = run_readonly_sql(
+            db_path,
+            "SELECT txn_date, description, amount, category FROM transactions "
+            "ORDER BY amount ASC LIMIT 5",
+        )
+        if result.get("ok"):
+            return "Largest expenses:\n" + json.dumps(result["rows"], indent=2)
+
+    return None
+
+
+def _last_ai_message(messages: Sequence[BaseMessage]) -> AIMessage | None:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            return msg
+    return None
+
+
+def _has_tool_calls(messages: Sequence[BaseMessage]) -> bool:
+    ai = _last_ai_message(messages)
+    return bool(ai and getattr(ai, "tool_calls", None))
+
+
+def build_finance_graph(
+    db_path: str,
+    llm: BaseChatModel,
+    *,
+    max_tool_retries: int = 1,
+) -> Any:
+    """Compile the LangGraph StateGraph for this database + LLM."""
+
+    tools = build_tools(db_path)
+    llm_with_tools = llm.bind_tools(tools)
+    tool_node = ToolNode(tools)
+
+    def guardrail(state: AgentState) -> dict[str, Any]:
+        question = state["question"]
+        if is_out_of_scope(question):
+            return {
+                "refused": True,
+                "answer": REFUSAL_TEXT,
+                "route": "guardrail",
+                "messages": [HumanMessage(content=question)],
+            }
+        return {
+            "refused": False,
+            "retry_count": 0,
+            "max_retries": state.get("max_retries", max_tool_retries),
+            "tool_error": None,
+            "messages": [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=question),
+            ],
+        }
+
+    def after_guardrail(state: AgentState) -> Literal["end", "rules_router"]:
+        return "end" if state.get("refused") else "rules_router"
+
+    def rules_router(state: AgentState) -> dict[str, Any]:
+        # Only short-circuit when the caller did not ask for the LLM path.
+        if state.get("use_llm"):
+            return {"route": "llm"}
+        hit = rule_route_answer(db_path, state["question"])
+        if hit is not None:
+            return {"answer": hit, "route": "rules", "refused": False}
+        return {"route": "llm"}
+
+    def after_rules(state: AgentState) -> Literal["end", "planner"]:
+        if state.get("route") == "rules" and state.get("answer"):
+            return "end"
+        return "planner"
+
+    def planner(state: AgentState) -> dict[str, Any]:
+        response = llm_with_tools.invoke(state["messages"])
+        return {"messages": [response], "route": "llm"}
+
+    def after_planner(state: AgentState) -> Literal["tools", "final_answer"]:
+        return "tools" if _has_tool_calls(state.get("messages") or []) else "final_answer"
+
+    def validate(state: AgentState) -> dict[str, Any]:
+        """Inspect the latest tool messages; schedule a retry on failure."""
+        messages = state.get("messages") or []
+        errors: list[str] = []
+        for msg in reversed(messages):
+            if not isinstance(msg, ToolMessage):
+                # Stop once we leave the most recent tool-message block.
+                if isinstance(msg, AIMessage):
+                    break
+                continue
+            if tool_result_failed(str(msg.content)):
+                errors.append(str(msg.content))
+        if not errors:
+            return {"tool_error": None}
+
+        retry_count = int(state.get("retry_count") or 0)
+        max_retries = int(state.get("max_retries") or max_tool_retries)
+        err_text = errors[0]
+        if retry_count < max_retries:
+            nudge = HumanMessage(
+                content=(
+                    f"Tool failed: {err_text}. "
+                    "Retry with a simpler valid SELECT-only query or use compute_aggregates."
+                )
+            )
+            return {
+                "tool_error": err_text,
+                "retry_count": retry_count + 1,
+                "messages": [nudge],
+            }
+        return {
+            "tool_error": err_text,
+            "answer": (
+                f"I could not complete that request after retries. Last error: {err_text}. "
+                "Try asking for a spending summary by category."
+            ),
+            "route": "llm",
+        }
+
+    def after_validate(state: AgentState) -> Literal["planner", "final_answer"]:
+        # Exhausted retries → validate already wrote a fallback answer.
+        if state.get("answer"):
+            return "final_answer"
+        # Tool failed and a retry nudge was appended → plan again.
+        if state.get("tool_error"):
+            messages = state.get("messages") or []
+            if messages and isinstance(messages[-1], HumanMessage):
+                return "planner"
+        return "final_answer"
+
+    def final_answer(state: AgentState) -> dict[str, Any]:
+        if state.get("answer"):
+            return {"refused": bool(state.get("refused")), "route": state.get("route") or "llm"}
+
+        messages = list(state.get("messages") or [])
+        ai = _last_ai_message(messages)
+        # If the last AI already has prose and no pending tool calls, use it.
+        if ai and not getattr(ai, "tool_calls", None) and str(ai.content).strip():
+            return {
+                "answer": str(ai.content),
+                "refused": False,
+                "route": state.get("route") or "llm",
+            }
+
+        # Otherwise ask the LLM (without forcing tools) for a grounded wrap-up.
+        wrap = llm.invoke(
+            messages
+            + [
+                HumanMessage(
+                    content=(
+                        "Using only the tool results above, answer the user's question "
+                        "concisely. If tools failed, say so."
+                    )
+                )
+            ]
+        )
+        return {
+            "answer": str(wrap.content),
+            "refused": False,
+            "route": state.get("route") or "llm",
+        }
+
+    graph = StateGraph(AgentState)
+    graph.add_node("guardrail", guardrail)
+    graph.add_node("rules_router", rules_router)
+    graph.add_node("planner", planner)
+    graph.add_node("tools", tool_node)
+    graph.add_node("validate", validate)
+    graph.add_node("final_answer", final_answer)
+
+    graph.add_edge(START, "guardrail")
+    graph.add_conditional_edges(
+        "guardrail",
+        after_guardrail,
+        {"end": END, "rules_router": "rules_router"},
+    )
+    graph.add_conditional_edges(
+        "rules_router",
+        after_rules,
+        {"end": END, "planner": "planner"},
+    )
+    graph.add_conditional_edges(
+        "planner",
+        after_planner,
+        {"tools": "tools", "final_answer": "final_answer"},
+    )
+    graph.add_edge("tools", "validate")
+    graph.add_conditional_edges(
+        "validate",
+        after_validate,
+        {"planner": "planner", "final_answer": "final_answer"},
+    )
+    graph.add_edge("final_answer", END)
+
+    return graph.compile()
 
 
 @dataclass
 class FinanceAgent:
-    """High-level façade over the finance tool loop."""
+    """Façade that owns a compiled LangGraph and preserves the public chat API."""
 
     db_path: str
     llm: BaseChatModel | None = None
     settings: Settings = field(default_factory=get_settings)
     max_tool_retries: int = 1
+    _graph: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.llm is None:
             self.llm = get_chat_model(self.settings, mock=True)
-
-    # ----- Guardrails -----------------------------------------------------
+        self._graph = build_finance_graph(
+            self.db_path, self.llm, max_tool_retries=self.max_tool_retries
+        )
 
     def is_out_of_scope(self, question: str) -> bool:
-        if any(p.search(question) for p in OUT_OF_SCOPE_PATTERNS):
-            return True
-        # Soft check: if it looks nothing like finance, refuse.
-        if not FINANCE_HINT.search(question) and len(question.split()) > 3:
-            # Allow short greetings through the soft check
-            if re.search(r"\b(hello|hi|hey|help|what can you)\b", question, re.I):
-                return False
-            return True
-        return False
-
-    # ----- Tools exposed to the LLM / router ------------------------------
+        return is_out_of_scope(question)
 
     def tool_run_sql(self, sql: str) -> dict[str, Any]:
         return run_readonly_sql(self.db_path, sql)
@@ -97,177 +389,24 @@ class FinanceAgent:
     def tool_categorise(self) -> dict[str, Any]:
         return categorise_all(self.db_path, only_null=True)
 
-    # ----- Deterministic router (no live LLM required) --------------------
-
-    def _rule_route(self, question: str) -> str | None:
-        """Answer common questions without an LLM so tests stay offline."""
-        q = question.lower()
-
-        if re.search(r"categoris|categorize|label (my )?transactions", q):
-            result = self.tool_categorise()
-            return f"Categorised {result['updated']} transactions using rule-based patterns."
-
-        if re.search(r"by category|spending summary|breakdown|aggregate", q) or (
-            "how much" in q and "category" in q
-        ):
-            result = self.tool_aggregates(group_by="category")
-            lines = [
-                f"- {row['key']}: total={row['total']}, spending={row['spending']}, n={row['n_txns']}"
-                for row in result["rows"][:15]
-            ]
-            return "Spending by category:\n" + "\n".join(lines)
-
-        if re.search(r"by month|monthly", q):
-            result = self.tool_aggregates(group_by="month")
-            lines = [
-                f"- {row['key']}: total={row['total']}, spending={row['spending']}"
-                for row in result["rows"][:12]
-            ]
-            return "Monthly totals:\n" + "\n".join(lines)
-
-        if re.search(r"total (income|earned)", q) or "how much did i earn" in q:
-            result = self.tool_run_sql(
-                "SELECT ROUND(SUM(amount), 2) AS income FROM transactions WHERE amount > 0"
-            )
-            if result.get("ok") and result["rows"]:
-                return f"Total income: {result['rows'][0].get('income')}"
-            return f"Could not compute income: {result.get('error')}"
-
-        if re.search(r"total (spend|spent|spending|expenses)", q) or "how much did i spend" in q:
-            result = self.tool_run_sql(
-                "SELECT ROUND(SUM(amount), 2) AS spending FROM transactions WHERE amount < 0"
-            )
-            if result.get("ok") and result["rows"]:
-                return f"Total spending: {result['rows'][0].get('spending')}"
-            return f"Could not compute spending: {result.get('error')}"
-
-        m = re.search(r"spend(?:ing)? on ([a-z &]+)", q)
-        if m:
-            cat = m.group(1).strip().rstrip("?")
-            result = self.tool_run_sql(
-                f"SELECT ROUND(SUM(amount), 2) AS spending, COUNT(*) AS n "
-                f"FROM transactions WHERE lower(category) = '{cat}' AND amount < 0"
-            )
-            if result.get("ok") and result["rows"]:
-                row = result["rows"][0]
-                return f"Spending on {cat}: {row.get('spending')} across {row.get('n')} transactions."
-
-        if "top" in q and "transaction" in q:
-            result = self.tool_run_sql(
-                "SELECT txn_date, description, amount, category FROM transactions "
-                "ORDER BY amount ASC LIMIT 5"
-            )
-            if result.get("ok"):
-                return "Largest expenses:\n" + json.dumps(result["rows"], indent=2)
-
-        return None
-
-    def _llm_tool_loop(self, question: str) -> str:
-        """Best-effort LLM tool-calling loop with one retry on failure."""
-        assert self.llm is not None
-        tools_desc = (
-            "Tools (call by writing JSON on its own line like "
-            '{"tool":"run_sql","sql":"SELECT ..."} or '
-            '{"tool":"aggregates","group_by":"category"} or '
-            '{"tool":"categorise"}):\n'
-            "- run_sql: read-only SELECT against transactions\n"
-            "- aggregates: group sums by category|account|month\n"
-            "- categorise: fill null categories with rules\n"
-        )
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT + "\n" + tools_desc),
-            HumanMessage(content=question),
-        ]
-        last_error: str | None = None
-        for attempt in range(self.max_tool_retries + 1):
-            try:
-                response = self.llm.invoke(messages)
-                text = str(response.content)
-                # Try to detect a tool call JSON blob
-                tool_match = re.search(r"\{[^{}]+\}", text)
-                if tool_match:
-                    payload = json.loads(tool_match.group())
-                    tool = payload.get("tool")
-                    if tool == "run_sql":
-                        result = self.tool_run_sql(payload.get("sql", "SELECT 1"))
-                    elif tool == "aggregates":
-                        result = self.tool_aggregates(
-                            group_by=payload.get("group_by", "category"),
-                            start_date=payload.get("start_date"),
-                            end_date=payload.get("end_date"),
-                        )
-                    elif tool == "categorise":
-                        result = self.tool_categorise()
-                    else:
-                        result = {"ok": False, "error": f"Unknown tool {tool}"}
-                    if isinstance(result, dict) and result.get("ok") is False:
-                        last_error = str(result.get("error"))
-                        messages.append(AIMessage(content=text))
-                        messages.append(
-                            HumanMessage(
-                                content=f"Tool failed: {last_error}. Try a simpler SELECT."
-                            )
-                        )
-                        continue
-                    messages.append(AIMessage(content=text))
-                    messages.append(
-                        HumanMessage(
-                            content=f"Tool result:\n{json.dumps(result, default=str)[:3000]}\n"
-                            "Now answer the user concisely using only these numbers."
-                        )
-                    )
-                    final = self.llm.invoke(messages)
-                    return str(final.content)
-                return text
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-                continue
-        return (
-            f"I could not complete that request after retries. Last error: {last_error}. "
-            "Try asking for a spending summary by category."
-        )
-
     def chat(self, question: str, *, use_llm: bool = False) -> dict[str, Any]:
-        """Answer a user question with guardrails and tools.
-
-        Args:
-            question: Natural-language question.
-            use_llm: If True, use the configured LLM tool loop. If False
-                (default for tests), use the deterministic rule router and
-                only fall back to the (possibly mock) LLM when needed.
-        """
-        if self.is_out_of_scope(question):
-            return {
-                "answer": (
-                    "I can only help with personal-finance questions about your "
-                    "transactions (spending, income, categories, aggregates). "
-                    "Please rephrase within that scope."
-                ),
-                "refused": True,
-                "route": "guardrail",
+        """Run the compiled graph and return ``{answer, refused, route}``."""
+        assert self._graph is not None
+        result = self._graph.invoke(
+            {
+                "question": question,
+                "use_llm": use_llm,
+                "messages": [],
+                "retry_count": 0,
+                "max_retries": self.max_tool_retries,
             }
-
-        # Prefer deterministic router for reliability / offline use
-        routed = self._rule_route(question)
-        if routed is not None and not use_llm:
-            return {"answer": routed, "refused": False, "route": "rules"}
-
-        if use_llm:
-            answer = self._llm_tool_loop(question)
-            return {"answer": answer, "refused": False, "route": "llm"}
-
-        # Fallback: try rules again, then mock/live LLM prose
-        if routed is not None:
-            return {"answer": routed, "refused": False, "route": "rules"}
-
-        assert self.llm is not None
-        response = self.llm.invoke(
-            [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=question),
-            ]
         )
-        return {"answer": str(response.content), "refused": False, "route": "llm-fallback"}
+        return {
+            "answer": result.get("answer")
+            or "I could not produce an answer. Please try rephrasing.",
+            "refused": bool(result.get("refused")),
+            "route": result.get("route"),
+        }
 
 
 def build_agent(
@@ -275,8 +414,9 @@ def build_agent(
     *,
     mock_llm: bool = False,
     settings: Settings | None = None,
+    llm: BaseChatModel | None = None,
 ) -> FinanceAgent:
-    """Factory used by CLI / API."""
+    """Factory used by CLI / API / tests."""
     cfg = settings or get_settings()
-    llm = get_chat_model(cfg, mock=mock_llm)
-    return FinanceAgent(db_path=db_path, llm=llm, settings=cfg)
+    model = llm if llm is not None else get_chat_model(cfg, mock=mock_llm)
+    return FinanceAgent(db_path=db_path, llm=model, settings=cfg)
